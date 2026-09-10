@@ -500,71 +500,154 @@ impl AppState {
                     .into_iter()
                     .collect()
             } else {
-                track.sources.iter().take(3).cloned().collect()
+                track.sources.iter().take(5).cloned().collect()
             };
-            let mut selected = None;
+            // Race the top candidates instead of betting on one: remote upload
+            // queues routinely stall a single source indefinitely, and the
+            // first transfer to finish wins while the losers get cancelled.
+            let mut enqueued = Vec::new();
             let mut last_error = String::new();
             for candidate in candidates {
                 let _ = app.emit("player://state", "connecting");
                 match self.request_download(&candidate).await {
-                    Ok(()) => {
-                        selected = Some(candidate);
-                        break;
-                    }
+                    Ok(()) => enqueued.push(candidate),
                     Err(error) => {
                         last_error = error;
                         let _ = app.emit("player://state", "searching_source");
                     }
                 }
             }
-            let source = selected.ok_or_else(|| {
-                if last_error.is_empty() {
+            if enqueued.is_empty() {
+                return Err(if last_error.is_empty() {
                     "当前没有可播放来源".into()
                 } else {
                     format!("音源连接失败：{last_error}")
-                }
-            })?;
-            let threshold = buffer_threshold(&source);
+                });
+            }
             let this = self.clone_parts();
             let app2 = app.clone();
             let track_id = track.id.clone();
+            let client = self.client.clone();
+            let settings = self.settings.clone();
             let incomplete_root = self.paths.cache_audio.clone();
             let completed_root = self.paths.downloads.clone();
-            let remote_name = source.filename.clone();
             let handle = tokio::spawn(async move {
                 let mut finished = false;
+                let mut winner: Option<usize> = None;
+                let mut sources = enqueued;
+                // Bounded waiting: a peer that will upload starts within a
+                // minute or two, and a healthy download grows steadily. Give
+                // up long before the absolute cap when neither is true — the
+                // transfers stay queued in slskd, so a later retry can pick
+                // them up where they stand.
+                const NO_RESPONSE_TICKS: u32 = 400; // ~2 min without any bytes
+                const STALL_TICKS: u32 = 300; // ~90 s without growth
+                let mut last_size: u64 = 0;
+                let mut stall_ticks: u32 = 0;
                 // Slow peers regularly need several minutes for one track; wait
-                // long enough for the transfer to actually finish (18 min).
-                for attempt in 0..3600 {
-                    if let Some(final_path) =
-                        find_ready_download(&completed_root, &remote_name, source.size)
-                    {
-                        match this.open_path(&final_path, app2.clone()).await {
-                            Ok(()) => {
-                                finished = true;
-                                break;
-                            }
-                            Err(_) => {
-                                // slskd can keep the destination locked briefly
-                                // after moving it out of the incomplete folder.
-                                let _ = app2.emit("player://state", "buffering");
+                // long enough for a transfer to actually finish (18 min), while
+                // dropping sources slskd marks dead ("Completed, Errored").
+                'outer: for attempt in 0..3600 {
+                    // A previous race may already have left a completed file.
+                    let mut failures = 0;
+                    let mut last_error = String::new();
+                    for (i, s) in sources.iter().enumerate() {
+                        if let Some(final_path) =
+                            find_ready_download(&completed_root, &s.filename, s.size)
+                        {
+                            match this.open_path(&final_path, app2.clone()).await {
+                                Ok(()) => {
+                                    finished = true;
+                                    winner = Some(i);
+                                    break;
+                                }
+                                Err(error) => {
+                                    failures += 1;
+                                    last_error = error;
+                                    // slskd can keep the destination locked
+                                    // briefly after moving the file out of the
+                                    // incomplete folder.
+                                    let _ = app2.emit("player://state", "buffering");
+                                }
                             }
                         }
                     }
-                    if let Some(temp) = find_incomplete(&incomplete_root, &remote_name) {
-                        if let Ok(m) = fs::metadata(&temp) {
-                            let len = m.len();
-                            let _ = app2.emit("player://state", "downloading");
-                            let _=app2.emit("player://position",json!({"position":0,"duration":track.duration,"buffered":if source.size>0{track.duration*len as f64/source.size as f64}else{0.}}));
-                            if len >= threshold {
-                                let _ = app2.emit("player://state", "buffering");
+                    if finished {
+                        break 'outer;
+                    }
+                    // Persistent player failures must surface instead of
+                    // spinning on "buffering" until the global timeout.
+                    if failures >= 10 {
+                        let _ = app2.emit("player://error", last_error);
+                        let _ = app2.emit("player://state", "error");
+                        break 'outer;
+                    }
+                    // Show progress from whichever source is furthest along.
+                    let mut best: Option<(u64, &Source)> = None;
+                    for s in &sources {
+                        if let Some(temp) = find_incomplete(&incomplete_root, &s.filename) {
+                            if let Ok(m) = fs::metadata(&temp) {
+                                if best.as_ref().map(|(len, _)| m.len() > *len).unwrap_or(true) {
+                                    best = Some((m.len(), s));
+                                }
                             }
                         }
                     }
-                    if attempt == 10 {
-                        let _ = app2.emit("player://state", "queued");
+                    let current = best.as_ref().map(|(len, _)| *len).unwrap_or(0);
+                    if current > last_size {
+                        last_size = current;
+                        stall_ticks = 0;
+                    } else {
+                        stall_ticks += 1;
+                    }
+                    if stall_ticks >= if last_size == 0 { NO_RESPONSE_TICKS } else { STALL_TICKS } {
+                        let _ = app2.emit("player://state", "timeout");
+                        break 'outer;
+                    }
+                    if let Some((len, s)) = best {
+                        let _ = app2.emit("player://state", "downloading");
+                        let _=app2.emit("player://position",json!({"position":0,"duration":track.duration,"buffered":if s.size>0{track.duration*len as f64/s.size as f64}else{0.}}));
+                        if len >= buffer_threshold(s) {
+                            let _ = app2.emit("player://state", "buffering");
+                        }
+                    } else if attempt >= 10 && attempt % 10 == 5 {
+                        // Still waiting on bytes: with several alive sources
+                        // this really is a race, but a lone one is just a
+                        // remote queue wait — tell the UI which of the two.
+                        let _ = app2.emit(
+                            "player://state",
+                            if sources.len() > 1 { "queued" } else { "waiting" },
+                        );
+                    }
+                    // Poll transfer states every ~3s and drop dead sources;
+                    // stop early once every candidate is exhausted.
+                    if attempt % 10 == 5 {
+                        if let Some(transfers) = fetch_transfers(&client, &settings).await {
+                            sources.retain(|s| {
+                                match find_transfer(&transfers, &s.username, &s.remote_path) {
+                                    Some(t) => t
+                                        .get("state")
+                                        .and_then(Value::as_str)
+                                        .map(|state| !transfer_dead(state))
+                                        .unwrap_or(true),
+                                    None => true,
+                                }
+                            });
+                            if sources.is_empty() {
+                                break 'outer;
+                            }
+                        }
                     }
                     sleep(Duration::from_millis(300)).await;
+                }
+                // A winner exists only when playback actually started; cancel
+                // the losing races so they stop eating bandwidth.
+                if let Some(i) = winner {
+                    for (j, s) in sources.iter().enumerate() {
+                        if j != i {
+                            let _ = remove_transfer(&client, &settings, s).await;
+                        }
+                    }
                 }
                 this.monitors.lock().await.remove(&track_id);
                 if !finished {
@@ -583,70 +666,7 @@ impl AppState {
         })
     }
     async fn request_download(&self, s: &Source) -> Result<(), String> {
-        let base = self
-            .settings
-            .read()
-            .slskd_url
-            .trim_end_matches('/')
-            .to_string();
-        // Already queued from an earlier attempt: slskd rejects re-enqueues, but
-        // the transfer will still complete, so treat it as success.
-        if self.transfer_exists(s).await {
-            return Ok(());
-        }
-        let body = json!([{"filename":s.remote_path,"size":s.size}]);
-        let response = self
-            .auth(
-                self.client
-                    .post(format!(
-                        "{base}/api/v0/transfers/downloads/{}",
-                        urlencoding::encode(&s.username)
-                    ))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        let result: Value = response.json().await.map_err(|e| e.to_string())?;
-        let enqueued = result
-            .get("enqueued")
-            .or_else(|| result.get("Enqueued"))
-            .and_then(Value::as_array)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        if enqueued == 0 {
-            // slskd 0.26 reports a duplicate request as failed:[{}] with no
-            // detail, so confirm against the transfer list before failing.
-            if self.transfer_exists(s).await {
-                return Ok(());
-            }
-            let failed = result
-                .get("failed")
-                .or_else(|| result.get("Failed"))
-                .map(Value::to_string)
-                .unwrap_or_else(|| "slskd 未接受该文件".into());
-            return Err(failed);
-        }
-        Ok(())
-    }
-    async fn transfer_exists(&self, s: &Source) -> bool {
-        let base = self
-            .settings
-            .read()
-            .slskd_url
-            .trim_end_matches('/')
-            .to_string();
-        let request = self
-            .auth(self.client.get(format!("{base}/api/v0/transfers/downloads")));
-        match request.send().await {
-            Ok(response) => match response.json::<Value>().await {
-                Ok(transfers) => find_transfer(&transfers, &s.username, &s.remote_path).is_some(),
-                Err(_) => false,
-            },
-            Err(_) => false,
-        }
+        request_download(&self.client, &self.settings, s).await
     }
     async fn open_mpv(&self, path: &Path, app: AppHandle) -> Result<(), String> {
         self.clone_parts().open_path(path, app).await
@@ -829,6 +849,8 @@ impl AppState {
                                 } else if state.contains("Failed")
                                     || state.contains("Cancelled")
                                     || state.contains("Rejected")
+                                    || state.contains("Aborted")
+                                    || state.contains("Errored")
                                     || state.contains("TimedOut")
                                 {
                                     "下载失败".into()
@@ -928,6 +950,18 @@ struct PlayerParts {
 impl PlayerParts {
     async fn open_path(&self, path: &Path, app: AppHandle) -> Result<(), String> {
         let mut lock = self.mpv.lock().await;
+        // Reap a player that exited behind our back: its IPC socket is dead
+        // forever, so respawn instead of failing on every later track.
+        let exited = matches!(
+            lock.as_mut().map(|mp| mp.child.try_wait()),
+            Some(Ok(Some(_)))
+        );
+        if exited {
+            if let Some(mut dead) = lock.take() {
+                let _ = dead.child.wait().await;
+                let _ = fs::remove_file(&dead.pipe);
+            }
+        }
         if lock.is_none() {
             let exe = if cfg!(windows) {
                 [self.runtime.join("mpv/mpv.exe"), PathBuf::from("mpv.exe")]
@@ -1157,6 +1191,129 @@ fn same_remote_path(a: &str, b: &str) -> bool {
     }
     let (a, b) = (normalize(a), normalize(b));
     a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+// Free-standing so the player monitor task can call them without holding
+// the whole AppState.
+async fn request_download(
+    client: &reqwest::Client,
+    settings: &RwLock<Settings>,
+    s: &Source,
+) -> Result<(), String> {
+    // Already queued from an earlier attempt: unless that transfer is dead it
+    // will still complete, so treat it as success. Dead transfers are removed
+    // and re-enqueued below to give the peer another chance.
+    if let Some(state) = transfer_state(client, settings, s).await {
+        if transfer_dead(&state) {
+            if !remove_transfer(client, settings, s).await {
+                // Could not clean up; the monitor will fail over instead.
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    }
+    let base = settings.read().slskd_url.trim_end_matches('/').to_string();
+    let body = json!([{"filename":s.remote_path,"size":s.size}]);
+    let mut request = client
+        .post(format!(
+            "{base}/api/v0/transfers/downloads/{}",
+            urlencoding::encode(&s.username)
+        ))
+        .json(&body);
+    {
+        let st = settings.read();
+        if !st.api_key.is_empty() {
+            request = request.header("X-API-Key", &st.api_key);
+        }
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let result: Value = response.json().await.map_err(|e| e.to_string())?;
+    let enqueued = result
+        .get("enqueued")
+        .or_else(|| result.get("Enqueued"))
+        .and_then(Value::as_array)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if enqueued == 0 {
+        // slskd 0.26 reports a duplicate request as failed:[{}] with no
+        // detail, so confirm against the transfer list before failing.
+        if let Some(state) = transfer_state(client, settings, s).await {
+            if !transfer_dead(&state) {
+                return Ok(());
+            }
+        }
+        let failed = result
+            .get("failed")
+            .or_else(|| result.get("Failed"))
+            .map(Value::to_string)
+            .unwrap_or_else(|| "slskd 未接受该文件".into());
+        return Err(failed);
+    }
+    Ok(())
+}
+fn transfer_dead(state: &str) -> bool {
+    ["Errored", "Failed", "Rejected", "Cancelled", "Aborted", "TimedOut"]
+        .iter()
+        .any(|keyword| state.contains(keyword))
+}
+async fn remove_transfer(
+    client: &reqwest::Client,
+    settings: &RwLock<Settings>,
+    s: &Source,
+) -> bool {
+    let base = settings.read().slskd_url.trim_end_matches('/').to_string();
+    let Some(transfers) = fetch_transfers(client, settings).await else {
+        return false;
+    };
+    let id = find_transfer(&transfers, &s.username, &s.remote_path)
+        .and_then(|t| t.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(id) = id else {
+        return false;
+    };
+    let mut request = client.delete(format!(
+        "{base}/api/v0/transfers/downloads/{}/{}",
+        urlencoding::encode(&s.username),
+        urlencoding::encode(&id)
+    ));
+    {
+        let st = settings.read();
+        if !st.api_key.is_empty() {
+            request = request.header("X-API-Key", &st.api_key);
+        }
+    }
+    matches!(request.send().await, Ok(response) if response.status().is_success())
+}
+// None when the transfer is not (yet) in slskd's queue.
+async fn transfer_state(
+    client: &reqwest::Client,
+    settings: &RwLock<Settings>,
+    s: &Source,
+) -> Option<String> {
+    fetch_transfers(client, settings)
+        .await
+        .as_ref()
+        .and_then(|transfers| find_transfer(transfers, &s.username, &s.remote_path))
+        .and_then(|t| t.get("state"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+async fn fetch_transfers(client: &reqwest::Client, settings: &RwLock<Settings>) -> Option<Value> {
+    let base = settings.read().slskd_url.trim_end_matches('/').to_string();
+    let mut request = client.get(format!("{base}/api/v0/transfers/downloads"));
+    {
+        let st = settings.read();
+        if !st.api_key.is_empty() {
+            request = request.header("X-API-Key", &st.api_key);
+        }
+    }
+    request.send().await.ok()?.json::<Value>().await.ok()
 }
 fn expand_search_queries(query: &str) -> Vec<String> {
     // Soulseek filenames are frequently tagged with romanized artist names even
