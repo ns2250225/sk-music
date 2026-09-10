@@ -56,6 +56,7 @@ pub struct AppState {
     queue: Arc<RwLock<Vec<String>>>,
     current: Arc<RwLock<Option<String>>>,
     mpv: Arc<Mutex<Option<Mpv>>>,
+    monitors: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 struct Mpv {
     child: Child,
@@ -121,6 +122,7 @@ impl AppState {
             )),
             current: Arc::new(RwLock::new(None)),
             mpv: Arc::new(Mutex::new(None)),
+            monitors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     pub async fn bootstrap(&self) -> Result<Bootstrap, String> {
@@ -457,6 +459,14 @@ impl AppState {
         app: AppHandle,
     ) -> Result<CommandStatus, String> {
         let track = self.get_track(id).ok_or("歌曲不存在")?;
+        // A fresh attempt supersedes monitors still waiting on earlier ones;
+        // their timeout events would otherwise clobber the new playback state.
+        {
+            let mut monitors = self.monitors.lock().await;
+            for (_, handle) in monitors.drain() {
+                handle.abort();
+            }
+        }
         let _ = app.emit("player://track", &track);
         let local_file = track
             .local_path
@@ -517,12 +527,15 @@ impl AppState {
             let threshold = buffer_threshold(&source);
             let this = self.clone_parts();
             let app2 = app.clone();
+            let track_id = track.id.clone();
             let incomplete_root = self.paths.cache_audio.clone();
             let completed_root = self.paths.downloads.clone();
             let remote_name = source.filename.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut finished = false;
-                for attempt in 0..300 {
+                // Slow peers regularly need several minutes for one track; wait
+                // long enough for the transfer to actually finish (18 min).
+                for attempt in 0..3600 {
                     if let Some(final_path) =
                         find_ready_download(&completed_root, &remote_name, source.size)
                     {
@@ -553,10 +566,15 @@ impl AppState {
                     }
                     sleep(Duration::from_millis(300)).await;
                 }
+                this.monitors.lock().await.remove(&track_id);
                 if !finished {
                     let _ = app2.emit("player://state", "error");
                 }
             });
+            self.monitors
+                .lock()
+                .await
+                .insert(id.to_string(), handle.abort_handle());
         }
         self.current.write().replace(id.into());
         self.db.history_add(id);
@@ -571,6 +589,11 @@ impl AppState {
             .slskd_url
             .trim_end_matches('/')
             .to_string();
+        // Already queued from an earlier attempt: slskd rejects re-enqueues, but
+        // the transfer will still complete, so treat it as success.
+        if self.transfer_exists(s).await {
+            return Ok(());
+        }
         let body = json!([{"filename":s.remote_path,"size":s.size}]);
         let response = self
             .auth(
@@ -594,6 +617,11 @@ impl AppState {
             .map(|v| v.len())
             .unwrap_or(0);
         if enqueued == 0 {
+            // slskd 0.26 reports a duplicate request as failed:[{}] with no
+            // detail, so confirm against the transfer list before failing.
+            if self.transfer_exists(s).await {
+                return Ok(());
+            }
             let failed = result
                 .get("failed")
                 .or_else(|| result.get("Failed"))
@@ -603,6 +631,23 @@ impl AppState {
         }
         Ok(())
     }
+    async fn transfer_exists(&self, s: &Source) -> bool {
+        let base = self
+            .settings
+            .read()
+            .slskd_url
+            .trim_end_matches('/')
+            .to_string();
+        let request = self
+            .auth(self.client.get(format!("{base}/api/v0/transfers/downloads")));
+        match request.send().await {
+            Ok(response) => match response.json::<Value>().await {
+                Ok(transfers) => find_transfer(&transfers, &s.username, &s.remote_path).is_some(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    }
     async fn open_mpv(&self, path: &Path, app: AppHandle) -> Result<(), String> {
         self.clone_parts().open_path(path, app).await
     }
@@ -610,6 +655,7 @@ impl AppState {
         PlayerParts {
             mpv: self.mpv.clone(),
             runtime: self.paths.runtime.clone(),
+            monitors: self.monitors.clone(),
         }
     }
     pub async fn player_command(&self, property: &str, value: Value) -> Result<(), String> {
@@ -877,6 +923,7 @@ impl AppState {
 struct PlayerParts {
     mpv: Arc<Mutex<Option<Mpv>>>,
     runtime: PathBuf,
+    monitors: Arc<Mutex<HashMap<String, tokio::task::AbortHandle>>>,
 }
 impl PlayerParts {
     async fn open_path(&self, path: &Path, app: AppHandle) -> Result<(), String> {
@@ -1077,7 +1124,11 @@ fn find_ready_download(root: &Path, filename: &str, expected_size: u64) -> Optio
 }
 fn find_transfer<'a>(value: &'a Value, username: &str, filename: &str) -> Option<&'a Value> {
     if value.get("username").and_then(Value::as_str) == Some(username)
-        && value.get("filename").and_then(Value::as_str) == Some(filename)
+        && value
+            .get("filename")
+            .and_then(Value::as_str)
+            .map(|f| same_remote_path(f, filename))
+            .unwrap_or(false)
     {
         return Some(value);
     }
@@ -1090,6 +1141,22 @@ fn find_transfer<'a>(value: &'a Value, username: &str, filename: &str) -> Option
             .find_map(|item| find_transfer(item, username, filename)),
         _ => None,
     }
+}
+// Search results carry the full remote path including slskd's "@@share-root"
+// prefix and Soulseek backslash separators, while the transfers API reports a
+// path relative to the share root. Compare case-insensitively by normalized
+// segments, allowing one side to be a tail of the other.
+fn same_remote_path(a: &str, b: &str) -> bool {
+    fn normalize(p: &str) -> String {
+        let p = p.replace('\\', "/");
+        let mut segments: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.first().map(|s| s.starts_with("@@")).unwrap_or(false) {
+            segments.remove(0);
+        }
+        segments.join("/").to_ascii_lowercase()
+    }
+    let (a, b) = (normalize(a), normalize(b));
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
 }
 fn expand_search_queries(query: &str) -> Vec<String> {
     // Soulseek filenames are frequently tagged with romanized artist names even
@@ -1244,5 +1311,34 @@ fn make_executable(path: &Path) {
         let mut perms = meta.permissions();
         perms.set_mode(perms.mode() | 0o111);
         let _ = fs::set_permissions(path, perms);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_remote_path;
+
+    #[test]
+    fn matches_share_root_prefix_and_separator_variants() {
+        assert!(same_remote_path(
+            r"@@qmdmb\_2nd\_2308\Album\04. 歌.flac",
+            r"_2nd\_2308\Album\04. 歌.flac"
+        ));
+        assert!(same_remote_path(
+            r"@@qmdmb\Cantonese\陈奕迅\Song.flac",
+            "cantonese/陈奕迅/song.flac"
+        ));
+    }
+
+    #[test]
+    fn rejects_unrelated_paths() {
+        assert!(!same_remote_path(
+            r"@@qmdmb\Cantonese\陈奕迅\Song.flac",
+            r"Other\Song.flac"
+        ));
+        assert!(!same_remote_path(
+            r"@@qmdmb\A\Song.flac",
+            r"@@ffff\B\Song.flac"
+        ));
     }
 }
