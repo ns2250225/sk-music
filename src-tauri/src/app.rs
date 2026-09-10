@@ -544,17 +544,19 @@ impl AppState {
                 const STALL_TICKS: u32 = 300; // ~90 s without growth
                 let mut last_size: u64 = 0;
                 let mut stall_ticks: u32 = 0;
+                let mut failures: u32 = 0;
+                let mut last_error = String::new();
                 // Slow peers regularly need several minutes for one track; wait
                 // long enough for a transfer to actually finish (18 min), while
                 // dropping sources slskd marks dead ("Completed, Errored").
                 'outer: for attempt in 0..3600 {
                     // A previous race may already have left a completed file.
-                    let mut failures = 0;
-                    let mut last_error = String::new();
+                    let mut attempted = false;
                     for (i, s) in sources.iter().enumerate() {
                         if let Some(final_path) =
                             find_ready_download(&completed_root, &s.filename, s.size)
                         {
+                            attempted = true;
                             match this.open_path(&final_path, app2.clone()).await {
                                 Ok(()) => {
                                     finished = true;
@@ -563,6 +565,15 @@ impl AppState {
                                 }
                                 Err(error) => {
                                     failures += 1;
+                                    log_player_event(
+                                        &this.runtime,
+                                        &format!(
+                                            "open_path failed ({}): {} ({})",
+                                            failures,
+                                            s.filename,
+                                            error
+                                        ),
+                                    );
                                     last_error = error;
                                     // slskd can keep the destination locked
                                     // briefly after moving the file out of the
@@ -576,11 +587,17 @@ impl AppState {
                         break 'outer;
                     }
                     // Persistent player failures must surface instead of
-                    // spinning on "buffering" until the global timeout.
-                    if failures >= 10 {
-                        let _ = app2.emit("player://error", last_error);
-                        let _ = app2.emit("player://state", "error");
-                        break 'outer;
+                    // spinning on "buffering" until the global timeout. The
+                    // counter only accumulates while a completed file is
+                    // actually being retried.
+                    if attempted {
+                        if failures >= 10 {
+                            let _ = app2.emit("player://error", last_error);
+                            let _ = app2.emit("player://state", "error");
+                            break 'outer;
+                        }
+                    } else {
+                        failures = 0;
                     }
                     // Show progress from whichever source is furthest along.
                     let mut best: Option<(u64, &Source)> = None;
@@ -593,16 +610,23 @@ impl AppState {
                             }
                         }
                     }
-                    let current = best.as_ref().map(|(len, _)| *len).unwrap_or(0);
-                    if current > last_size {
-                        last_size = current;
-                        stall_ticks = 0;
-                    } else {
-                        stall_ticks += 1;
-                    }
-                    if stall_ticks >= if last_size == 0 { NO_RESPONSE_TICKS } else { STALL_TICKS } {
-                        let _ = app2.emit("player://state", "timeout");
-                        break 'outer;
+                    // The stall watchdog only governs the download phase. Once
+                    // a completed file exists, the failures cap above bounds
+                    // the player-opening phase instead.
+                    if !attempted {
+                        let current = best.as_ref().map(|(len, _)| *len).unwrap_or(0);
+                        if current > last_size {
+                            last_size = current;
+                            stall_ticks = 0;
+                        } else {
+                            stall_ticks += 1;
+                        }
+                        if stall_ticks
+                            >= if last_size == 0 { NO_RESPONSE_TICKS } else { STALL_TICKS }
+                        {
+                            let _ = app2.emit("player://state", "timeout");
+                            break 'outer;
+                        }
                     }
                     if let Some((len, s)) = best {
                         let _ = app2.emit("player://state", "downloading");
@@ -990,23 +1014,40 @@ impl PlayerParts {
             #[cfg(not(windows))]
             let _ = fs::remove_file(&pipe);
             let ipc_arg = format!("--input-ipc-server={pipe}");
-            let child = Command::new(exe)
-                .args([
-                    "--no-config",
-                    "--no-video",
-                    "--idle=yes",
-                    "--keep-open=no",
-                    "--audio-display=no",
-                    "--force-window=no",
-                    "--terminal=no",
-                    &ipc_arg,
-                ])
+            // Capture mpv stderr for post-mortem; the process is silent in
+            // normal operation so the log only grows on real errors.
+            let log_dir = self.runtime.join("logs");
+            let _ = fs::create_dir_all(&log_dir);
+            let mpv_log = fs::File::create(log_dir.join("mpv.log")).ok();
+            let mut command = Command::new(exe);
+            command.args([
+                "--no-config",
+                "--no-video",
+                "--idle=yes",
+                "--keep-open=no",
+                "--audio-display=no",
+                "--force-window=no",
+                "--terminal=no",
+                &ipc_arg,
+            ]);
+            match mpv_log {
+                Some(file) => {
+                    command.stderr(Stdio::from(file));
+                }
+                None => {
+                    command.stderr(Stdio::null());
+                }
+            };
+            let child = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
                 .no_window()
                 .spawn()
-                .map_err(|_| {
+                .map_err(|error| {
+                    log_player_event(
+                        &self.runtime,
+                        &format!("mpv spawn failed: {error}"),
+                    );
                     if cfg!(windows) {
                         "未找到 mpv。请将 mpv.exe 放入应用 runtime/mpv 目录或系统 PATH".to_string()
                     } else {
@@ -1014,6 +1055,7 @@ impl PlayerParts {
                             .to_string()
                     }
                 })?;
+            log_player_event(&self.runtime, "mpv spawned");
             *lock = Some(Mpv {
                 child,
                 pipe: pipe.clone(),
@@ -1104,20 +1146,48 @@ async fn mpv_request(pipe: &str, message: Value) -> Result<Value, String> {
     let mut bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     client.write_all(&bytes).await.map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    BufReader::new(client)
-        .read_line(&mut response)
+    // mpv broadcasts events to every connected client; skip those until the
+    // actual command response (with an "error" field) arrives.
+    let mut lines = BufReader::new(client).lines();
+    while let Some(line) = lines
+        .next_line()
         .await
-        .map_err(|e| e.to_string())?;
-    let value: Value = serde_json::from_str(&response).map_err(|e| e.to_string())?;
-    if value.get("error").and_then(Value::as_str) != Some("success") {
-        return Err(value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("mpv command failed")
-            .to_string());
+        .map_err(|e| e.to_string())?
+    {
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("event").is_some() {
+            continue;
+        }
+        if value.get("error").and_then(Value::as_str) != Some("success") {
+            return Err(value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("mpv command failed")
+                .to_string());
+        }
+        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
     }
-    Ok(value.get("data").cloned().unwrap_or(Value::Null))
+    Err("mpv 连接已关闭".into())
+}
+fn log_player_event(runtime: &Path, line: &str) {
+    use std::io::Write;
+    let dir = runtime.join("logs");
+    let _ = fs::create_dir_all(&dir);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("player.log"))
+    {
+        let _ = writeln!(
+            file,
+            "[{}] {}",
+            chrono::Local::now().format("%m-%d %H:%M:%S"),
+            line
+        );
+    }
 }
 fn find_cached(dir: &Path, id: &str) -> Option<PathBuf> {
     fs::read_dir(dir)
