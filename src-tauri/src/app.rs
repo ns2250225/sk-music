@@ -16,11 +16,36 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::windows::named_pipe::ClientOptions,
     process::{Child, Command},
     sync::Mutex,
     time::sleep,
 };
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(not(windows))]
+use tokio::net::UnixStream;
+
+// 0x08000000 = CREATE_NO_WINDOW, only meaningful for console hosts on Windows.
+#[cfg(windows)]
+trait NoWindow {
+    fn no_window(&mut self) -> &mut Self;
+}
+#[cfg(windows)]
+impl NoWindow for Command {
+    fn no_window(&mut self) -> &mut Self {
+        self.creation_flags(0x08000000)
+    }
+}
+#[cfg(not(windows))]
+trait NoWindow {
+    fn no_window(&mut self) -> &mut Self;
+}
+#[cfg(not(windows))]
+impl NoWindow for Command {
+    fn no_window(&mut self) -> &mut Self {
+        self
+    }
+}
 
 pub struct AppState {
     pub db: Database,
@@ -190,13 +215,12 @@ impl AppState {
         });
     }
     pub async fn reconnect(&self) -> String {
-        let exe = self.paths.runtime.join("slskd/slskd.exe");
+        let exe = slskd_exe(&self.paths.runtime);
         if exe.exists() {
             let _ = self.write_slskd_config();
             if self.application_state().await.is_some() {
-                if let Ok(mut child) = Command::new("taskkill.exe")
-                    .args(["/F", "/IM", "slskd.exe"])
-                    .creation_flags(0x08000000)
+                if let Ok(mut child) = kill_slskd_command()
+                    .no_window()
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
@@ -211,7 +235,7 @@ impl AppState {
                 .arg("--app-dir")
                 .arg(self.paths.runtime.join("slskd-data"))
                 .arg("--no-version-check")
-                .creation_flags(0x08000000)
+                .no_window()
                 .spawn();
             for _ in 0..60 {
                 sleep(Duration::from_millis(500)).await;
@@ -829,8 +853,13 @@ impl AppState {
         } else {
             &s.api_key
         };
-        let downloads = self.paths.downloads.to_string_lossy().replace('/', "\\");
-        let incomplete = self.paths.cache_audio.to_string_lossy().replace('/', "\\");
+        let downloads = self.paths.downloads.to_string_lossy().into_owned();
+        let incomplete = self.paths.cache_audio.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let (downloads, incomplete) = (
+            downloads.replace('/', "\\"),
+            incomplete.replace('/', "\\"),
+        );
         let yaml = format!("soulseek:\n  username: '{}'\n  password: '{}'\nweb:\n  port: 5030\n  url_base: /\n  content_path: wwwroot\n  authentication:\n    disabled: true\n  ip_address: 127.0.0.1\n  api_keys:\n    soulmusic:\n      key: '{}'\n      role: administrator\ndirectories:\n  downloads: '{}'\n  incomplete: '{}'\nshares:\n  directories: []\n", s.username.replace('\'', "''"), s.password.replace('\'', "''"), token, downloads, incomplete);
         fs::write(self.paths.runtime.join("slskd/slskd.yml"), yaml).map_err(|e| e.to_string())
     }
@@ -853,11 +882,32 @@ impl PlayerParts {
     async fn open_path(&self, path: &Path, app: AppHandle) -> Result<(), String> {
         let mut lock = self.mpv.lock().await;
         if lock.is_none() {
-            let exe = [self.runtime.join("mpv/mpv.exe"), PathBuf::from("mpv.exe")]
+            let exe = if cfg!(windows) {
+                [self.runtime.join("mpv/mpv.exe"), PathBuf::from("mpv.exe")]
+                    .into_iter()
+                    .find(|p| p.exists())
+                    .unwrap_or(PathBuf::from("mpv.exe"))
+            } else {
+                [
+                    self.runtime.join("mpv/mpv.app/Contents/MacOS/mpv"),
+                    self.runtime.join("mpv/mpv"),
+                    PathBuf::from("/opt/homebrew/bin/mpv"),
+                    PathBuf::from("/usr/local/bin/mpv"),
+                ]
                 .into_iter()
                 .find(|p| p.exists())
-                .unwrap_or(PathBuf::from("mpv.exe"));
-            let pipe = format!(r"\\.\pipe\soulmusic-mpv-{}", std::process::id());
+                .unwrap_or(PathBuf::from("mpv"))
+            };
+            let pipe = if cfg!(windows) {
+                format!(r"\\.\pipe\soulmusic-mpv-{}", std::process::id())
+            } else {
+                std::env::temp_dir()
+                    .join(format!("soulmusic-mpv-{}.sock", std::process::id()))
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            #[cfg(not(windows))]
+            let _ = fs::remove_file(&pipe);
             let ipc_arg = format!("--input-ipc-server={pipe}");
             let child = Command::new(exe)
                 .args([
@@ -873,10 +923,15 @@ impl PlayerParts {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .creation_flags(0x08000000)
+                .no_window()
                 .spawn()
                 .map_err(|_| {
-                    "未找到 mpv。请将 mpv.exe 放入应用 runtime/mpv 目录或系统 PATH".to_string()
+                    if cfg!(windows) {
+                        "未找到 mpv。请将 mpv.exe 放入应用 runtime/mpv 目录或系统 PATH".to_string()
+                    } else {
+                        "mpv 启动失败。请将 mpv 放入应用 runtime/mpv 目录，或执行 brew install mpv 后重试"
+                            .to_string()
+                    }
                 })?;
             *lock = Some(Mpv {
                 child,
@@ -942,8 +997,16 @@ impl PlayerParts {
         Err("播放器无法打开已下载音频，文件可能仍被下载服务占用".into())
     }
 }
+#[cfg(windows)]
+async fn mpv_connect(pipe: &str) -> Result<NamedPipeClient, String> {
+    ClientOptions::new().open(pipe).map_err(|e| e.to_string())
+}
+#[cfg(not(windows))]
+async fn mpv_connect(pipe: &str) -> Result<UnixStream, String> {
+    UnixStream::connect(pipe).await.map_err(|e| e.to_string())
+}
 async fn mpv_send(pipe: &str, msg: Value) -> Result<(), String> {
-    let mut c = ClientOptions::new().open(pipe).map_err(|e| e.to_string())?;
+    let mut c = mpv_connect(pipe).await?;
     let mut b = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
     b.push(b'\n');
     c.write_all(&b).await.map_err(|e| e.to_string())
@@ -956,7 +1019,7 @@ async fn mpv_get(pipe: &str, property: &str) -> Result<Value, String> {
     .await
 }
 async fn mpv_request(pipe: &str, message: Value) -> Result<Value, String> {
-    let mut client = ClientOptions::new().open(pipe).map_err(|e| e.to_string())?;
+    let mut client = mpv_connect(pipe).await?;
     let mut bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     client.write_all(&bytes).await.map_err(|e| e.to_string())?;
@@ -1099,21 +1162,87 @@ fn safe_name(s: &str) -> String {
         .collect()
 }
 
+// slskd ships as slskd.exe on Windows; elsewhere the app looks for a native
+// binary next to the app data first, then common Homebrew locations.
+fn slskd_exe(runtime: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return runtime.join("slskd/slskd.exe");
+    }
+    [
+        runtime.join("slskd/slskd"),
+        PathBuf::from("/opt/homebrew/bin/slskd"),
+        PathBuf::from("/usr/local/bin/slskd"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .unwrap_or_else(|| runtime.join("slskd/slskd"))
+}
+fn kill_slskd_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("taskkill.exe");
+        c.args(["/F", "/IM", "slskd.exe"]);
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = Command::new("pkill");
+        c.args(["-x", "slskd"]);
+        c
+    }
+}
+
 fn ensure_embedded_runtime(paths: &Paths) -> Result<(), Box<dyn std::error::Error>> {
-    let slskd_dir = paths.runtime.join("slskd");
-    if !slskd_dir.join("slskd.exe").exists() {
-        fs::create_dir_all(&slskd_dir)?;
-        let bytes = include_bytes!("../runtime-assets/slskd.zip");
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-        archive.extract(&slskd_dir)?;
+    // Each platform ships its own slskd/mpv builds inside the binary and
+    // unpacks them on first launch. Files written by the app carry no
+    // quarantine attribute, so the runtime binaries pass Gatekeeper.
+    #[cfg(windows)]
+    {
+        let slskd_dir = paths.runtime.join("slskd");
+        if !slskd_dir.join("slskd.exe").exists() {
+            fs::create_dir_all(&slskd_dir)?;
+            let bytes = include_bytes!("../runtime-assets/slskd.zip");
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+            archive.extract(&slskd_dir)?;
+        }
+        let mpv_dir = paths.runtime.join("mpv");
+        if !mpv_dir.join("mpv.exe").exists() {
+            fs::create_dir_all(&mpv_dir)?;
+            let archive_path = paths.runtime.join("mpv-runtime.7z");
+            fs::write(&archive_path, include_bytes!("../runtime-assets/mpv.7z"))?;
+            sevenz_rust::decompress_file(&archive_path, &mpv_dir)?;
+            let _ = fs::remove_file(archive_path);
+        }
     }
-    let mpv_dir = paths.runtime.join("mpv");
-    if !mpv_dir.join("mpv.exe").exists() {
-        fs::create_dir_all(&mpv_dir)?;
-        let archive_path = paths.runtime.join("mpv-runtime.7z");
-        fs::write(&archive_path, include_bytes!("../runtime-assets/mpv.7z"))?;
-        sevenz_rust::decompress_file(&archive_path, &mpv_dir)?;
-        let _ = fs::remove_file(archive_path);
+    #[cfg(not(windows))]
+    {
+        let slskd_dir = paths.runtime.join("slskd");
+        if !slskd_dir.join("slskd").exists() {
+            fs::create_dir_all(&slskd_dir)?;
+            let bytes = include_bytes!("../runtime-assets/slskd-macos.zip");
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+            archive.extract(&slskd_dir)?;
+            make_executable(&slskd_dir.join("slskd"));
+        }
+        let mpv_dir = paths.runtime.join("mpv");
+        if !mpv_dir.join("mpv.app/Contents/MacOS/mpv").exists() {
+            fs::create_dir_all(&mpv_dir)?;
+            let bytes = include_bytes!("../runtime-assets/mpv-macos.zip");
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+            archive.extract(&mpv_dir)?;
+            make_executable(&mpv_dir.join("mpv.app/Contents/MacOS/mpv"));
+        }
     }
+    let _ = paths;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        let _ = fs::set_permissions(path, perms);
+    }
 }
