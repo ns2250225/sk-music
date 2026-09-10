@@ -1,0 +1,4 @@
+export interface Source { id:string; username:string; remotePath:string; filename:string; size:number; format:string; bitrate?:number; sampleRate?:number; bitDepth?:number; uploadSpeed?:number; queueLength?:number; score:number }
+export interface Track { id:string; title:string; artist:string; album:string; duration:number; cover?:string; localPath?:string; formats:string[]; sourceCount:number; favorite:boolean; sources?:Source[] }
+export interface Download { id:string; track:Track; status:string; downloadedBytes:number; totalBytes:number; speed:number; localPath?:string }
+export interface Settings { username:string; password:string; autoAccount:boolean; selectorMode:string; preferLossless:boolean; preferFlac:boolean; minimumBitrate:number; bufferSeconds:number; prefetchCount:number; cacheLimitGb:number; downloadDirectory:string; organizeDownloads:boolean; bandwidthLimit:number; slskdUrl:string; apiKey:string; closeToTray:boolean }

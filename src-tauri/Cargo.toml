@@ -1,0 +1,47 @@
+[package]
+name = "soulmusic"
+version = "0.1.0"
+description = "A friendly Soulseek music player"
+authors = ["SoulMusic"]
+edition = "2021"
+
+[lib]
+name = "soulmusic_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "SoulMusic"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+walkdir = "2"
+lofty = "0.22"
+dirs = "6"
+rand = "0.9"
+urlencoding = "2"
+parking_lot = "0.12"
+thiserror = "2"
+chrono = "0.4"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+sevenz-rust = "0.6"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+strip = true
+opt-level = "s"

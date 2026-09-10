@@ -1,0 +1,1 @@
+{"identifier":"default","description":"SoulMusic desktop capabilities","windows":["main"],"permissions":["core:default","dialog:allow-open","shell:allow-open"]}

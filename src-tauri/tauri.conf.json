@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SoulMusic",
+  "version": "0.1.0",
+  "identifier": "com.soulmusic.desktop",
+  "build": {"beforeDevCommand":"npm run dev","devUrl":"http://127.0.0.1:1420","beforeBuildCommand":"npm run build","frontendDist":"../dist"},
+  "app": {
+    "windows": [{"title":"SoulMusic","width":1280,"height":800,"minWidth":900,"minHeight":650,"center":true,"decorations":true,"transparent":false}],
+    "security": {"csp":null}
+  },
+  "bundle": {"active":false,"targets":"all","icon":[]}
+}
