@@ -53,12 +53,25 @@ pub mod normalize {
         format!("track_{}", &hex::encode(h.finalize())[..16])
     }
     pub fn parse(name: &str) -> (String, String) {
-        let s = clean(name);
-        let p: Vec<_> = s.split(" - ").collect();
-        if p.len() > 1 {
-            (p[1..].join(" - "), p[0].into())
+        let filename = name.rsplit(['\\', '/']).next().unwrap_or(name);
+        let stem = filename.rsplit_once('.').map(|x| x.0).unwrap_or(filename);
+        if let Some((artist, title)) = stem.split_once(" - ") {
+            (clean(title), clean(artist))
         } else {
-            (s, "未知艺术家".into())
+            (clean(stem), "未知艺术家".into())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse;
+
+        #[test]
+        fn parses_artist_title_separator_before_cleaning() {
+            assert_eq!(
+                parse(r"Music\Chris Medina - What Are Words. flac"),
+                ("what are words".into(), "chris medina".into())
+            );
         }
     }
 }

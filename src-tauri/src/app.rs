@@ -255,7 +255,12 @@ impl AppState {
                 "filterResponses": false,
                 "minimumResponseFileCount": 0,
                 "maximumPeerQueueLength": 1000000,
-                "minimumPeerUploadSpeed": 0
+                "minimumPeerUploadSpeed": 0,
+                // slskd only persists response details after a search is
+                // complete. Its 15 second default is measured from the most
+                // recent response, so busy searches routinely outlived our
+                // old 24 second polling window and appeared empty.
+                "searchTimeout": 5000
             });
             if let Ok(response) = self
                 .auth(
@@ -285,7 +290,7 @@ impl AppState {
         }
         // Wait for all original/alias/broad searches. Responses can arrive late and
         // different distributed parents often cover different parts of the network.
-        for _ in 0..30 {
+        for _ in 0..50 {
             sleep(Duration::from_millis(800)).await;
             let mut complete = 0usize;
             for id in &search_ids {
@@ -335,12 +340,10 @@ impl AppState {
                 .get("queueLength")
                 .and_then(Value::as_u64)
                 .map(|x| x as u32);
-            for f in response
-                .get("files")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-            {
+            // Soulseek separates publicly downloadable and locked shares.  The
+            // official Qt client displays both, so omitting `lockedFiles` can
+            // make an otherwise valid search look completely empty.
+            for f in search_response_files(&response) {
                 let path = f
                     .get("filename")
                     .or_else(|| f.get("path"))
@@ -1182,6 +1185,36 @@ fn expand_search_queries(query: &str) -> Vec<String> {
     queries.dedup();
     queries.truncate(4);
     queries
+}
+
+fn search_response_files(response: &Value) -> Vec<Value> {
+    ["files", "lockedFiles"]
+        .into_iter()
+        .filter_map(|key| response.get(key).and_then(Value::as_array))
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::search_response_files;
+    use serde_json::json;
+
+    #[test]
+    fn includes_regular_and_locked_search_results() {
+        let response = json!({
+            "files": [{"filename": "public.mp3"}],
+            "lockedFiles": [{"filename": "Chris Medina - What Are Words. flac"}]
+        });
+
+        let names: Vec<_> = search_response_files(&response)
+            .into_iter()
+            .filter_map(|file| file["filename"].as_str().map(str::to_owned))
+            .collect();
+
+        assert_eq!(names, ["public.mp3", "Chris Medina - What Are Words. flac"]);
+    }
 }
 fn dir_size(p: &Path) -> u64 {
     walkdir::WalkDir::new(p)
