@@ -21,7 +21,7 @@ async fn search_tracks(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<Vec<Track>, String> {
-    let tracks = state.search(&query, refresh).await?;
+    let tracks = state.search(&query, refresh, app.clone()).await?;
     let _ = app.emit("search://updated", &tracks);
     Ok(tracks)
 }
@@ -96,10 +96,13 @@ fn favorite_track(
 async fn download_track(
     track_id: String,
     preference: String,
+    source_id: Option<String>,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    state.download(&track_id, &preference, app).await
+    state
+        .download(&track_id, &preference, source_id.as_deref(), app)
+        .await
 }
 #[tauri::command]
 fn cancel_download(id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {

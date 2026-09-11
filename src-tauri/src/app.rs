@@ -253,7 +253,7 @@ impl AppState {
         }
         .into()
     }
-    pub async fn search(&self, q: &str, refresh: bool) -> Result<Vec<Track>, String> {
+    pub async fn search(&self, q: &str, refresh: bool, app: AppHandle) -> Result<Vec<Track>, String> {
         let key = normalize::clean(q);
         if !refresh {
             if let Some(x) = self.db.cache_get(&key) {
@@ -276,8 +276,12 @@ impl AppState {
         for network_query in expand_search_queries(q) {
             let body = json!({
                 "searchText": network_query,
-                "responseLimit": 1000,
-                "fileLimit": 50000,
+                // slskd only serves the responses REST endpoint once a search
+                // leaves InProgress, so keep the limits small enough that busy
+                // queries hit ResponseLimitReached in a few seconds instead of
+                // trickling until the 15s inactivity timeout (~40s total).
+                "responseLimit": 250,
+                "fileLimit": 10000,
                 "filterResponses": false,
                 "minimumResponseFileCount": 0,
                 "maximumPeerQueueLength": 1000000,
@@ -309,11 +313,16 @@ impl AppState {
         if search_ids.is_empty() {
             return Err("未能启动 Soulseek 搜索，请稍后重试".into());
         }
-        // Wait for all original/alias/broad searches. Responses can arrive late and
-        // different distributed parents often cover different parts of the network.
-        for _ in 0..30 {
-            sleep(Duration::from_millis(800)).await;
+        // Wait for every search to finish (limits reached, or 15s without new
+        // responses). The responses endpoint returns an empty list while a
+        // search is still in flight, so polling isComplete is not optional —
+        // fetching early always yields nothing. Busy queries finish in seconds
+        // via the response limit; quiet ones take ~15s to time out.
+        let mut collected = 0u64;
+        for _ in 0..45 {
+            sleep(Duration::from_millis(1000)).await;
             let mut complete = 0usize;
+            collected = 0;
             for id in &search_ids {
                 if let Ok(response) = self
                     .auth(self.client.get(format!("{base}/api/v0/searches/{id}")))
@@ -321,6 +330,10 @@ impl AppState {
                     .await
                 {
                     if let Ok(state) = response.json::<Value>().await {
+                        collected += state
+                            .get("responseCount")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
                         if state
                             .get("isComplete")
                             .and_then(Value::as_bool)
@@ -331,25 +344,35 @@ impl AppState {
                     }
                 }
             }
+            let _ = app.emit("search://progress", collected);
             if complete == search_ids.len() {
                 break;
             }
         }
         let mut groups: HashMap<String, Track> = HashMap::new();
         let mut responses = Vec::new();
-        for id in &search_ids {
-            if let Ok(response) = self
-                .auth(
-                    self.client
-                        .get(format!("{base}/api/v0/searches/{id}/responses")),
-                )
-                .send()
-                .await
-            {
-                if let Ok(data) = response.json::<Value>().await {
-                    responses.extend(data.as_array().cloned().unwrap_or_default());
+        // The completion edge can race the response snapshot; one retry keeps
+        // a completed search from being reported as empty by accident.
+        for attempt in 0..3 {
+            responses.clear();
+            for id in &search_ids {
+                if let Ok(response) = self
+                    .auth(
+                        self.client
+                            .get(format!("{base}/api/v0/searches/{id}/responses")),
+                    )
+                    .send()
+                    .await
+                {
+                    if let Ok(data) = response.json::<Value>().await {
+                        responses.extend(data.as_array().cloned().unwrap_or_default());
+                    }
                 }
             }
+            if !responses.is_empty() || collected == 0 || attempt == 2 {
+                break;
+            }
+            sleep(Duration::from_millis(1500)).await;
         }
         for response in responses {
             let user = response
@@ -372,7 +395,7 @@ impl AppState {
                     .or_else(|| f.get("path"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if !normalize::is_audio(path) {
+                if !normalize::is_audio(path) || f.get("isLocked").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
                 let size = f.get("size").and_then(Value::as_u64).unwrap_or(0);
@@ -382,6 +405,11 @@ impl AppState {
                     .or_else(|| f.get("bitrate"))
                     .and_then(Value::as_u64)
                     .map(|x| x as u32);
+                let sample_rate = f
+                    .get("sampleRate")
+                    .and_then(Value::as_u64)
+                    .map(|x| x as u32);
+                let bit_depth = f.get("bitDepth").and_then(Value::as_u64).map(|x| x as u16);
                 if ext == "MP3" && bitrate.unwrap_or(320) < self.settings.read().minimum_bitrate {
                     continue;
                 }
@@ -397,8 +425,8 @@ impl AppState {
                     size,
                     format: ext.clone(),
                     bitrate,
-                    sample_rate: None,
-                    bit_depth: None,
+                    sample_rate,
+                    bit_depth,
                     upload_speed: speed,
                     queue_length: queue,
                     score: 0.,
@@ -449,6 +477,15 @@ impl AppState {
         });
         if !out.is_empty() {
             self.db.cache_put(&key, &out);
+        }
+        if out.is_empty() && collected == 0 {
+            // The Soulseek server silently drops search requests when the same
+            // account fires them too often (worse without upload privileges),
+            // and genuinely rare keywords also come back empty.
+            return Err(
+                "这次搜索没有收到任何网络响应：可能搜索太频繁触发了 Soulseek 服务器限流，请等待半分钟后再试，或换个关键词"
+                    .into(),
+            );
         }
         Ok(out)
     }
@@ -790,9 +827,23 @@ impl AppState {
     pub fn favorite(&self, id: &str, on: bool) -> Result<(), String> {
         self.db.favorite(id, on)
     }
-    pub async fn download(&self, id: &str, _pref: &str, app: AppHandle) -> Result<(), String> {
+    pub async fn download(
+        &self,
+        id: &str,
+        _pref: &str,
+        source_id: Option<&str>,
+        app: AppHandle,
+    ) -> Result<(), String> {
         let track = self.get_track(id).ok_or("歌曲不存在")?;
-        let source = track.sources.first().cloned().ok_or("没有下载来源")?;
+        let source = match source_id {
+            Some(sid) => track
+                .sources
+                .iter()
+                .find(|s| s.id == sid)
+                .cloned()
+                .ok_or("指定的来源不存在")?,
+            None => track.sources.first().cloned().ok_or("没有下载来源")?,
+        };
         let did = format!("download_{}", uuid::Uuid::new_v4());
         let ext = source.format.to_ascii_lowercase();
         let dir = if self.settings.read().download_directory.is_empty() {
