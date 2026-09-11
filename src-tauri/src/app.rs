@@ -981,19 +981,29 @@ impl PlayerParts {
             let monitor_pipe = pipe.clone();
             let monitor_app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let mut was_eof = false;
+                let mut playback_active = false;
                 loop {
                     let position = mpv_get(&monitor_pipe, "time-pos").await;
                     let duration = mpv_get(&monitor_pipe, "duration").await;
+                    let idle = mpv_get(&monitor_pipe, "idle-active")
+                        .await
+                        .ok()
+                        .and_then(|value| value.as_bool());
                     let eof = mpv_get(&monitor_pipe, "eof-reached")
                         .await
                         .ok()
                         .and_then(|value| value.as_bool())
                         .unwrap_or(false);
-                    if eof && !was_eof {
-                        let _ = monitor_app.emit("player://ended", ());
+                    if idle == Some(false) && (position.is_ok() || duration.is_ok()) {
+                        playback_active = true;
                     }
-                    was_eof = eof;
+                    // With keep-open=no mpv unloads the file at EOF, so the EOF
+                    // property can disappear before it is polled. The active ->
+                    // idle transition is the reliable completion signal.
+                    if playback_active && (eof || idle == Some(true)) {
+                        let _ = monitor_app.emit("player://ended", ());
+                        playback_active = false;
+                    }
                     if position.is_err() && duration.is_err() {
                         sleep(Duration::from_millis(500)).await;
                         continue;
