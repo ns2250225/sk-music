@@ -470,11 +470,11 @@ impl AppState {
             };
             let mut selected = None;
             let mut last_error = String::new();
-            for candidate in candidates {
+            for candidate in &candidates {
                 let _ = app.emit("player://state", "connecting");
                 match self.request_download(&candidate).await {
                     Ok(()) => {
-                        selected = Some(candidate);
+                        selected = Some(candidate.clone());
                         break;
                     }
                     Err(error) => {
@@ -490,33 +490,54 @@ impl AppState {
                     format!("音源连接失败：{last_error}")
                 }
             })?;
-            let threshold = buffer_threshold(&source);
+            let mut sources = vec![source.clone()];
+            sources.extend(
+                candidates
+                    .into_iter()
+                    .filter(|candidate| candidate.id != source.id),
+            );
             let this = self.clone_parts();
             let app2 = app.clone();
             let incomplete_root = self.paths.cache_audio.clone();
             let completed_root = self.paths.downloads.clone();
-            let remote_name = source.filename.clone();
+            let client = self.client.clone();
+            let settings = self.settings.clone();
             tokio::spawn(async move {
                 let mut finished = false;
-                for attempt in 0..300 {
-                    if let Some(final_path) =
-                        find_ready_download(&completed_root, &remote_name, source.size)
-                    {
-                        match this.open_path(&final_path, app2.clone()).await {
-                            Ok(()) => {
-                                finished = true;
-                                break;
-                            }
-                            Err(_) => {
-                                // slskd can keep the destination locked briefly
-                                // after moving it out of the incomplete folder.
-                                let _ = app2.emit("player://state", "buffering");
+                let mut active = 0usize;
+                let mut stalled_polls = 0u32;
+                let mut last_bytes = 0u64;
+                for _ in 0..3000 {
+                    // A source queued earlier can still complete after a fallback
+                    // has started, so accept the first complete copy from any peer.
+                    for candidate in &sources {
+                        if let Some(final_path) = find_ready_download(
+                            &completed_root,
+                            &candidate.filename,
+                            candidate.size,
+                        ) {
+                            match this.open_path(&final_path, app2.clone()).await {
+                                Ok(()) => {
+                                    finished = true;
+                                    break;
+                                }
+                                Err(_) => {
+                                    let _ = app2.emit("player://state", "buffering");
+                                }
                             }
                         }
                     }
-                    if let Some(temp) = find_incomplete(&incomplete_root, &remote_name) {
+                    if finished {
+                        break;
+                    }
+                    let source = &sources[active];
+                    let threshold = buffer_threshold(source);
+                    let mut progressed = false;
+                    if let Some(temp) = find_incomplete(&incomplete_root, &source.filename) {
                         if let Ok(m) = fs::metadata(&temp) {
                             let len = m.len();
+                            progressed = len > last_bytes;
+                            last_bytes = len;
                             let _ = app2.emit("player://state", "downloading");
                             let _=app2.emit("player://position",json!({"position":0,"duration":track.duration,"buffered":if source.size>0{track.duration*len as f64/source.size as f64}else{0.}}));
                             if len >= threshold {
@@ -524,8 +545,40 @@ impl AppState {
                             }
                         }
                     }
-                    if attempt == 10 {
-                        let _ = app2.emit("player://state", "queued");
+                    stalled_polls = if progressed { 0 } else { stalled_polls + 1 };
+                    if stalled_polls == 10 {
+                        let state = if sources.len() > 1 {
+                            "queued"
+                        } else {
+                            "waiting_source"
+                        };
+                        let _ = app2.emit("player://state", state);
+                    }
+                    // Give each peer up to 90 seconds without byte progress.
+                    // Then switch to the next ranked source, or fail only after
+                    // the final (or unique) source has had the full timeout.
+                    if stalled_polls >= 300 {
+                        if active + 1 < sources.len() {
+                            let next = &sources[active + 1];
+                            let _ = app2.emit("player://state", "searching_source");
+                            if request_download_with(&client, &settings, next)
+                                .await
+                                .is_ok()
+                            {
+                                active += 1;
+                                last_bytes = 0;
+                                stalled_polls = 0;
+                                let _ = app2.emit("player://state", "connecting");
+                            } else {
+                                // Skip a source that is no longer online and try
+                                // the following one on the next pass.
+                                active += 1;
+                                last_bytes = 0;
+                                stalled_polls = 300;
+                            }
+                        } else {
+                            break;
+                        }
                     }
                     sleep(Duration::from_millis(300)).await;
                 }
@@ -534,6 +587,7 @@ impl AppState {
                 }
             });
         }
+        self.add_queue(id, app.clone())?;
         self.current.write().replace(id.into());
         self.db.history_add(id);
         Ok(CommandStatus {
@@ -541,43 +595,7 @@ impl AppState {
         })
     }
     async fn request_download(&self, s: &Source) -> Result<(), String> {
-        let base = self
-            .settings
-            .read()
-            .slskd_url
-            .trim_end_matches('/')
-            .to_string();
-        let body = json!([{"filename":s.remote_path,"size":s.size}]);
-        let response = self
-            .auth(
-                self.client
-                    .post(format!(
-                        "{base}/api/v0/transfers/downloads/{}",
-                        urlencoding::encode(&s.username)
-                    ))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?;
-        let result: Value = response.json().await.map_err(|e| e.to_string())?;
-        let enqueued = result
-            .get("enqueued")
-            .or_else(|| result.get("Enqueued"))
-            .and_then(Value::as_array)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        if enqueued == 0 {
-            let failed = result
-                .get("failed")
-                .or_else(|| result.get("Failed"))
-                .map(Value::to_string)
-                .unwrap_or_else(|| "slskd 未接受该文件".into());
-            return Err(failed);
-        }
-        Ok(())
+        request_download_with(&self.client, &self.settings, s).await
     }
     async fn open_mpv(&self, path: &Path, app: AppHandle) -> Result<(), String> {
         self.clone_parts().open_path(path, app).await
@@ -605,18 +623,42 @@ impl AppState {
             }
         }
     }
-    pub async fn next(&self, app: AppHandle) -> Result<(), String> {
+    pub async fn next(&self, shuffle: bool, app: AppHandle) -> Result<(), String> {
         let ids = self.queue.read().clone();
-        let cur = self.current.read().clone();
-        let n = cur
-            .and_then(|c| ids.iter().position(|x| x == &c))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        if let Some(id) = ids.get(n) {
-            self.play(id, None, app).await.map(|_| ())
-        } else {
-            Ok(())
+        if ids.is_empty() {
+            return Ok(());
         }
+        let cur = self.current.read().clone();
+        let current_index = cur
+            .and_then(|c| ids.iter().position(|x| x == &c))
+            .unwrap_or(0);
+        let next_index = if shuffle && ids.len() > 1 {
+            let candidate = rand::random_range(0..ids.len() - 1);
+            if candidate >= current_index {
+                candidate + 1
+            } else {
+                candidate
+            }
+        } else {
+            (current_index + 1) % ids.len()
+        };
+        self.play(&ids[next_index], None, app).await.map(|_| ())
+    }
+    pub async fn previous(&self, app: AppHandle) -> Result<(), String> {
+        let ids = self.queue.read().clone();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let cur = self.current.read().clone();
+        let current_index = cur
+            .and_then(|c| ids.iter().position(|x| x == &c))
+            .unwrap_or(0);
+        let previous_index = if current_index == 0 {
+            ids.len() - 1
+        } else {
+            current_index - 1
+        };
+        self.play(&ids[previous_index], None, app).await.map(|_| ())
     }
     pub fn add_queue(&self, id: &str, app: AppHandle) -> Result<(), String> {
         if self.get_track(id).is_none() {
@@ -845,6 +887,51 @@ impl AppState {
         Ok(before)
     }
 }
+async fn request_download_with(
+    client: &reqwest::Client,
+    settings: &Arc<RwLock<Settings>>,
+    source: &Source,
+) -> Result<(), String> {
+    let (base, api_key) = {
+        let current = settings.read();
+        (
+            current.slskd_url.trim_end_matches('/').to_string(),
+            current.api_key.clone(),
+        )
+    };
+    let body = json!([{"filename":source.remote_path,"size":source.size}]);
+    let mut request = client
+        .post(format!(
+            "{base}/api/v0/transfers/downloads/{}",
+            urlencoding::encode(&source.username)
+        ))
+        .json(&body);
+    if !api_key.is_empty() {
+        request = request.header("X-API-Key", api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let result: Value = response.json().await.map_err(|e| e.to_string())?;
+    let enqueued = result
+        .get("enqueued")
+        .or_else(|| result.get("Enqueued"))
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if enqueued == 0 {
+        let failed = result
+            .get("failed")
+            .or_else(|| result.get("Failed"))
+            .map(Value::to_string)
+            .unwrap_or_else(|| "slskd 未接受该文件".into());
+        return Err(failed);
+    }
+    Ok(())
+}
 struct PlayerParts {
     mpv: Arc<Mutex<Option<Mpv>>>,
     runtime: PathBuf,
@@ -894,9 +981,19 @@ impl PlayerParts {
             let monitor_pipe = pipe.clone();
             let monitor_app = app.clone();
             tauri::async_runtime::spawn(async move {
+                let mut was_eof = false;
                 loop {
                     let position = mpv_get(&monitor_pipe, "time-pos").await;
                     let duration = mpv_get(&monitor_pipe, "duration").await;
+                    let eof = mpv_get(&monitor_pipe, "eof-reached")
+                        .await
+                        .ok()
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    if eof && !was_eof {
+                        let _ = monitor_app.emit("player://ended", ());
+                    }
+                    was_eof = eof;
                     if position.is_err() && duration.is_err() {
                         sleep(Duration::from_millis(500)).await;
                         continue;

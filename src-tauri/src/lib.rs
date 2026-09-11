@@ -57,12 +57,16 @@ async fn set_volume(volume: f64, state: tauri::State<'_, AppState>) -> Result<()
         .await
 }
 #[tauri::command]
-async fn next(state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
-    state.next(app).await
+async fn next(
+    shuffle: bool,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    state.next(shuffle, app).await
 }
 #[tauri::command]
-async fn previous(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.player_command("seek", serde_json::json!(0)).await
+async fn previous(state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
+    state.previous(app).await
 }
 #[tauri::command]
 fn add_to_queue(
